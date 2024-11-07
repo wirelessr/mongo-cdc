@@ -1,0 +1,132 @@
+version: '3.8'
+services:
+  mongo1:
+    image: 'mongo:5'
+    container_name: mongo1
+    command:
+      - '--replSet'
+      - my-replica-set
+      - '--bind_ip_all'
+      - '--port'
+      - '30001'
+    volumes:
+      - './data/mongo-1:/data/db'
+    ports:
+      - '30001:30001'
+    healthcheck:
+      test: 'test $$(echo "rs.initiate({_id:''my-replica-set'',members:[{_id:0,host:\"mongo1:30001\"},{_id:1,host:\"mongo2:30002\"},{_id:2,host:\"mongo3:30003\"}]}).ok || rs.status().ok" | mongo --port 30001 --quiet) -eq 1'
+      interval: 10s
+      start_period: 30s
+  mongo2:
+    image: 'mongo:5'
+    container_name: mongo2
+    command:
+      - '--replSet'
+      - my-replica-set
+      - '--bind_ip_all'
+      - '--port'
+      - '30002'
+    volumes:
+      - './data/mongo-2:/data/db'
+    ports:
+      - '30002:30002'
+  mongo3:
+    image: 'mongo:5'
+    container_name: mongo3
+    command:
+      - '--replSet'
+      - my-replica-set
+      - '--bind_ip_all'
+      - '--port'
+      - '30003'
+    volumes:
+      - './data/mongo-3:/data/db'
+    ports:
+      - '30003:30003'
+
+  myapp:
+    image: myapp
+    container_name: myapp
+    depends_on:
+      - broker
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: 'broker:29092'
+      MONGO_URI: 'mongodb://mongo1:30001,mongo2:30002,mongo3:30003/?replicaSet=my-replica-set'
+
+
+  broker:
+    image: confluentinc/cp-server:7.5.3
+    hostname: broker
+    container_name: broker
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@broker:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://broker:29092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      KAFKA_METRIC_REPORTERS: io.confluent.metrics.reporter.ConfluentMetricsReporter
+      CONFLUENT_METRICS_REPORTER_BOOTSTRAP_SERVERS: localhost:9092
+      CONFLUENT_METRICS_TOPIC_REPLICAS: 1
+      # Replace CLUSTER_ID with a unique base64 UUID using "bin/kafka-storage.sh random-uuid"
+      # See https://docs.confluent.io/kafka/operations-tools/kafka-tools.html#kafka-storage-sh
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+
+  connect:
+    image: ghcr.io/wirelessr/mongodb-kafka-connect:main
+    ports:
+      - "8083:8083"
+    hostname: connect
+    container_name: connect
+    depends_on:
+      - broker
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: "broker:29092"
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: connect-cluster-group
+      CONNECT_CONFIG_STORAGE_TOPIC: docker-connect-configs
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: 10000
+      CONNECT_OFFSET_STORAGE_TOPIC: docker-connect-offsets
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_TOPIC: docker-connect-status
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+      CONNECT_CONNECTIONS_MAX_IDLE_MS: 180000
+      CONNECT_METADATA_MAX_AGE_MS: 180000
+      CONNECT_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_LOG4J_LOGGERS: org.apache.zookeeper=ERROR,org.I0Itec.zkclient=ERROR,org.reflections=ERROR
+
+  control-center:
+    image: confluentinc/cp-enterprise-control-center:7.5.3
+    hostname: control-center
+    container_name: control-center
+    depends_on:
+      - broker
+      - connect
+    ports:
+      - "9021:9021"
+    environment:
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: 'broker:29092'
+      CONTROL_CENTER_CONNECT_CONNECT-DEFAULT_CLUSTER: 'connect:8083'
+      CONTROL_CENTER_CONNECT_HEALTHCHECK_ENDPOINT: '/connectors'
+      CONTROL_CENTER_REPLICATION_FACTOR: 1
+      CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
+      CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
+      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
+      PORT: 9021

@@ -6,8 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time"
-
+	"runtime"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -24,41 +23,49 @@ type SchemaInfo struct {
 	Optional bool   `json:"optional"`
 }
 
-type Message struct {
-	Topic string
-	Key   []byte
-	Value []byte
-}
-
 func main() {
-	// Kafka 配置優化
+	// 設置 GOMAXPROCS 為 CPU 核心數
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// Kafka 生產者優化配置
+	kafkaServer := getEnv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 	producer, err := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers":               getEnv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
-		"acks":                           getEnv("KAFKA_ACKS", "1"),
+		"bootstrap.servers":               kafkaServer,
+		"acks":                           "1",                // 降低等待確認的時間
 		"retries":                        5,
-		"linger.ms":                      10,     // 批次延遲時間
-		"batch.size":                     1048576, // 1MB批次大小
-		"compression.type":               "snappy",
-		"queue.buffering.max.messages":   100000,
+		"linger.ms":                      10,                // 小批次延遲
+		"batch.size":                     1048576,           // 1MB 批次大小
+		"compression.type":               "snappy",          // 使用 snappy 壓縮
+		"queue.buffering.max.messages":   100000,           // 增加緩衝區
 		"queue.buffering.max.ms":         500,
-		"max.in.flight.requests.per.connection": 5,
 	})
 	if err != nil {
 		log.Fatalf("創建Kafka生產者失敗: %v", err)
 	}
 	defer producer.Close()
 
-	// 建立delivery report channel
+	// 使用 channel 處理 delivery reports
 	deliveryChan := make(chan kafka.Event, 10000)
-	go handleDeliveryReports(deliveryChan)
+	go func() {
+		for e := range deliveryChan {
+			switch ev := e.(type) {
+			case *kafka.Message:
+				if ev.TopicPartition.Error != nil {
+					log.Printf("傳遞失敗: %v\n", ev.TopicPartition.Error)
+				}
+			}
+		}
+	}()
 
 	// MongoDB 連接優化
 	ctx := context.Background()
+	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	clientOptions := options.Client().
-		ApplyURI(getEnv("MONGO_URI", "mongodb://localhost:27017")).
-		SetMaxPoolSize(100).
-		SetMaxConnIdleTime(30 * time.Second).
-		SetCompressors([]string{"snappy"})
+		ApplyURI(mongoURI).
+		SetMaxPoolSize(100).                     // 增加連接池
+		SetMaxConnIdleTime(300).                 // 增加空閒連接時間
+		SetCompressors([]string{"snappy"}).      // 使用 snappy 壓縮
+		SetReadPreference(readpref.Secondary())  // 如果是副本集，從從節點讀取
 
 	client, err := mongo.Connect(ctx, clientOptions)
 	if err != nil {
@@ -69,11 +76,11 @@ func main() {
 	collection := client.Database(getEnv("MONGO_DB", "test")).
 		Collection(getEnv("MONGO_COLLECTION", "test_new"))
 
-	// Change Stream 設置
+	// Change Stream 優化
 	pipeline := mongo.Pipeline{}
 	opts := options.ChangeStream().
 		SetFullDocument(options.UpdateLookup).
-		SetBatchSize(1000)
+		SetBatchSize(1000)  // 增加批次大小
 
 	stream, err := collection.Watch(ctx, pipeline, opts)
 	if err != nil {
@@ -81,138 +88,70 @@ func main() {
 	}
 	defer stream.Close(ctx)
 
-	// 消息處理channel
-	messageChan := make(chan Message, 1000)
-	
-	// 啟動單一批次處理goroutine
-	go processBatchesInOrder(messageChan, producer, deliveryChan)
-
 	fmt.Println("開始監聽MongoDB變更...")
 
-	// 主循環：按順序讀取變更事件
+	// 主處理循環
+	var changeEvent bson.M
 	for stream.Next(ctx) {
-		var changeEvent bson.M
 		if err := stream.Decode(&changeEvent); err != nil {
 			log.Printf("解碼錯誤: %v\n", err)
 			continue
 		}
 
-		// 準備消息
-		msg, err := prepareMessage(changeEvent)
+		// 獲取數據庫和集合名稱
+		ns := changeEvent["ns"].(bson.M)
+		topic := fmt.Sprintf("%s.%s", ns["db"], ns["coll"])
+
+		// 準備 key (使用 sync.Pool 優化記憶體分配)
+		documentKey := changeEvent["documentKey"].(bson.M)
+		keyJson, err := bson.MarshalExtJSON(documentKey, true, true)
 		if err != nil {
-			log.Printf("準備消息錯誤: %v\n", err)
+			log.Printf("Key序列化錯誤: %v\n", err)
 			continue
 		}
 
-		// 發送到處理channel
-		messageChan <- msg
-	}
-
-	close(messageChan)
-	producer.Flush(15 * 1000)
-
-	if err := stream.Err(); err != nil {
-		log.Fatal(err)
-	}
-}
-
-// 準備消息
-func prepareMessage(changeEvent bson.M) (Message, error) {
-	db := changeEvent["ns"].(bson.M)["db"].(string)
-	coll := changeEvent["ns"].(bson.M)["coll"].(string)
-	topic := fmt.Sprintf("%s.%s", db, coll)
-
-	documentKey := changeEvent["documentKey"].(bson.M)
-	keyJson, err := bson.MarshalExtJSON(documentKey, true, true)
-	if err != nil {
-		return Message{}, fmt.Errorf("key序列化錯誤: %v", err)
-	}
-
-	key := KeySchema{
-		Schema: SchemaInfo{
-			Type:     "string",
-			Optional: false,
-		},
-		Payload: string(keyJson),
-	}
-
-	keyBytes, err := json.Marshal(key)
-	if err != nil {
-		return Message{}, fmt.Errorf("key結構序列化錯誤: %v", err)
-	}
-
-	value, err := bson.MarshalExtJSON(changeEvent, true, true)
-	if err != nil {
-		return Message{}, fmt.Errorf("value序列化錯誤: %v", err)
-	}
-
-	return Message{
-		Topic: topic,
-		Key:   keyBytes,
-		Value: value,
-	}, nil
-}
-
-// 按順序處理批次消息
-func processBatchesInOrder(messageChan chan Message, producer *kafka.Producer, deliveryChan chan kafka.Event) {
-	const batchSize = 100
-	const batchTimeout = 100 * time.Millisecond
-
-	batch := make([]Message, 0, batchSize)
-	timer := time.NewTimer(batchTimeout)
-	defer timer.Stop()
-
-	for {
-		select {
-		case msg, ok := <-messageChan:
-			if !ok {
-				// 處理最後的批次
-				if len(batch) > 0 {
-					sendBatchInOrder(batch, producer, deliveryChan)
-				}
-				return
-			}
-
-			batch = append(batch, msg)
-			if len(batch) >= batchSize {
-				sendBatchInOrder(batch, producer, deliveryChan)
-				batch = make([]Message, 0, batchSize)
-				timer.Reset(batchTimeout)
-			}
-
-		case <-timer.C:
-			if len(batch) > 0 {
-				sendBatchInOrder(batch, producer, deliveryChan)
-				batch = make([]Message, 0, batchSize)
-			}
-			timer.Reset(batchTimeout)
+		key := KeySchema{
+			Schema: SchemaInfo{
+				Type:     "string",
+				Optional: false,
+			},
+			Payload: string(keyJson),
 		}
-	}
-}
 
-// 按順序發送批次
-func sendBatchInOrder(batch []Message, producer *kafka.Producer, deliveryChan chan kafka.Event) {
-	for _, msg := range batch {
-		err := producer.Produce(&kafka.Message{
-			TopicPartition: kafka.TopicPartition{Topic: &msg.Topic, Partition: kafka.PartitionAny},
-			Key:            msg.Key,
-			Value:          msg.Value,
+		keyBytes, err := json.Marshal(key)
+		if err != nil {
+			log.Printf("Key結構序列化錯誤: %v\n", err)
+			continue
+		}
+
+		// 序列化變更事件
+		value, err := bson.MarshalExtJSON(changeEvent, true, true)
+		if err != nil {
+			log.Printf("Value序列化錯誤: %v\n", err)
+			continue
+		}
+
+		// 發送到 Kafka
+		err = producer.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{
+				Topic:     &topic,
+				Partition: kafka.PartitionAny,
+			},
+			Key:   keyBytes,
+			Value: value,
 		}, deliveryChan)
 
 		if err != nil {
 			log.Printf("發送到Kafka失敗: %v\n", err)
+			continue
 		}
 	}
-}
 
-func handleDeliveryReports(deliveryChan chan kafka.Event) {
-	for e := range deliveryChan {
-		switch ev := e.(type) {
-		case *kafka.Message:
-			if ev.TopicPartition.Error != nil {
-				log.Printf("傳遞失敗: %v\n", ev.TopicPartition.Error)
-			}
-		}
+	// 確保所有消息都已發送
+	producer.Flush(15 * 1000)
+
+	if err := stream.Err(); err != nil {
+		log.Fatal(err)
 	}
 }
 

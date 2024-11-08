@@ -35,7 +35,6 @@ func main() {
 		"retries":                        5,
 		"linger.ms":                      10,                // 小批次延遲
 		"batch.size":                     1048576,           // 1MB 批次大小
-		"compression.type":               "snappy",          // 使用 snappy 壓縮
 		"queue.buffering.max.messages":   100000,           // 增加緩衝區
 		"queue.buffering.max.ms":         500,
 	})

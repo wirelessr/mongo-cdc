@@ -30,9 +30,15 @@ func main() {
 		kafkaServer = "localhost:9092"
 	}
 
+	kafkaAcks := os.Getenv("KAFKA_ACKS")
+	if kafkaAcks == "" {
+		kafkaAcks = "all"
+	}
+
+
 	producer, err := kafka.NewProducer(&kafka.ConfigMap{
 		"bootstrap.servers": kafkaServer,
-		"acks":              "all",
+		"acks":              kafkaAcks,
 		"retries":           5,
 	})
 	if err != nil {

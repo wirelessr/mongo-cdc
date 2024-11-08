@@ -41,7 +41,6 @@ func main() {
 		"compression.type":               "snappy",
 		"queue.buffering.max.messages":   100000,
 		"queue.buffering.max.ms":         500,
-		"enable.idempotence":            true,    // 啟用冪等性
 		"max.in.flight.requests.per.connection": 5,
 	})
 	if err != nil {

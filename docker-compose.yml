@@ -45,7 +45,7 @@ services:
       - '30003:30003'
 
   myapp:
-    image: myapp
+    image: ghcr.io/wirelessr/mongo-cdc:main
     container_name: myapp
     depends_on:
       - broker
